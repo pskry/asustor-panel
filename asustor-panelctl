@@ -1,0 +1,39 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Scripting front end for asustor-panel.
+#
+# Talks to the daemon over a unix socket rather than to the serial port, because two
+# readers on one line split the MCU's button frames between them at random and the panel
+# starts missing presses for no visible reason.
+set -eu
+
+SOCK=${ASUSTOR_PANEL_SOCKET:-/run/asustor-panel.sock}
+
+usage() {
+  cat <<'EOF'
+usage: asustor-panelctl <command>
+
+  text <0|1> [string]   write one line (0 is the top line); pins the display
+  clear                 blank both lines; pins the display
+  auto                  resume cycling the status screens
+  screen <n>            jump to status screen n and resume cycling
+  off                   turn the display off
+  on                    turn it back on (power-cycles the panel MCU, takes ~4s)
+  status                report mode, current screen and both lines
+
+Button hooks: drop an executable at /etc/asustor-panel/hooks/<button>, where <button> is
+up, down, back, enter, copy or power. It is run detached, with the button name as its
+first argument.
+EOF
+}
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+case "$1" in
+  -h|--help|help) usage; exit 0 ;;
+esac
+
+[ -S "$SOCK" ] || { echo "no panel daemon at $SOCK" >&2; exit 1; }
+
+# Not nc: it is absent on several of the distributions this runs on, where socat is
+# present, and one dependency is enough.
+printf '%s\n' "$*" | socat -t2 - "UNIX-CONNECT:$SOCK"

@@ -1,0 +1,25 @@
+[Unit]
+Description=Asustor front panel display and buttons
+# Nothing to wait for: the panel is on a legacy serial port that exists from boot. The
+# ordering that matters is the other direction, and it is not expressible here: a getty
+# on the same port fights this daemon for every byte, so mask serial-getty@ttyS1.
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/asustor-panel
+Restart=always
+RestartSec=10
+
+# NOT hardened with ProtectSystem=strict. The daemon writes the panel's power rail under
+# /sys/class/leds to reset the MCU, which is the only known way back from a display that
+# command 0x11 has turned off.
+ProtectHome=true
+PrivateTmp=true
+
+# PrivateDevices would scrub /dev, taking both the serial port the panel lives on and the
+# input devices the copy and power buttons arrive through.
+PrivateDevices=false
+
+[Install]
+WantedBy=multi-user.target

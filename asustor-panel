@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Front panel daemon for Asustor NAS hardware: two lines of status, buttons back.
+
+The panel is a microcontroller on a serial port. It renders 16x2 characters and reports
+its own button presses, and no Linux driver knows it exists: the four buttons beside the
+display are absent from the input layer and are on none of the Super I/O GPIO lines.
+
+See README.md for the protocol and how it was recovered.
+"""
+
+import errno
+import os
+import select
+import shlex
+import socket
+import struct
+import subprocess
+import sys
+import termios
+import time
+
+CONFIG_PATH = os.environ.get("ASUSTOR_PANEL_CONFIG", "/etc/asustor-panel.conf")
+
+DEFAULTS = {
+    # Probed in order; the one that answers the init frame wins. Identification is by
+    # handshake and never by name, because a panel that is not there and a panel at the
+    # wrong baud are indistinguishable otherwise.
+    "ports": "/dev/ttyS1 /dev/ttyS0 /dev/ttyS4",
+    "baud": "115200",
+    "interval": "6",
+    "keys_device": "asustor-keys",
+    "power_device": "Power Button",
+    "socket": "/run/asustor-panel.sock",
+    "hook_dir": "/etc/asustor-panel/hooks",
+    "lcd_power": "/sys/class/leds/power:lcd/brightness",
+}
+
+HOST_HDR = 0xF0
+MCU_HDR = 0xF1
+
+CMD_DISPLAY = 0x11
+CMD_INIT = 0x13
+CMD_TEXT = 0x27
+CMD_BUTTON = 0x80
+
+BUTTONS = {0x01: "up", 0x02: "down", 0x03: "back", 0x04: "enter"}
+
+# The two buttons that are not the MCU's. Copy is a Super I/O GPIO behind an input
+# device; power is ACPI. Three mechanisms, one hook interface.
+INPUT_KEYS = {116: "power", 133: "copy"}
+
+WIDTH = 16
+
+# struct input_event on 64-bit: two 64-bit time fields, then type, code, value.
+INPUT_EVENT = struct.Struct("llHHi")
+EV_KEY = 0x01
+
+
+def load_config(path=CONFIG_PATH):
+    """Read key=value lines. Absent file means defaults, which is a working setup."""
+    cfg = dict(DEFAULTS)
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                cfg[key.strip()] = value.strip()
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            raise
+    return cfg
+
+
+CFG = load_config()
+PORTS = shlex.split(CFG["ports"])
+BAUD = int(CFG["baud"])
+INTERVAL = int(CFG["interval"])
+SOCKET_PATH = CFG["socket"]
+HOOK_DIR = CFG["hook_dir"]
+LCD_POWER = CFG["lcd_power"]
+
+
+def frame(cmd, args):
+    """Build a frame. The checksum is the 8-bit sum of every preceding byte.
+
+    Two layouts, and the MCU IGNORES a frame built with the wrong one: no reply, no
+    error, nothing. The length byte counts the payload minus one, and a total above 0x15
+    moves the checksum to a fixed offset 21 instead of letting it follow the payload.
+    """
+    body = bytes([cmd]) + bytes(args)
+    length = len(body) - 1
+    buf = bytearray([HOST_HDR, length]) + body
+    if length + 4 > 0x15:
+        buf += bytes(21 - len(buf))
+    buf.append(sum(buf) & 0xFF)
+    return bytes(buf)
+
+
+def text_frame(line, text):
+    text = text[:WIDTH].ljust(WIDTH)
+    payload = [line, 0x00]
+    payload += [ord(c) if 32 <= ord(c) < 127 else 0x20 for c in text]
+    return frame(CMD_TEXT, payload)
+
+
+def open_port(path):
+    fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    attrs = termios.tcgetattr(fd)
+    speed = getattr(termios, "B%d" % BAUD)
+    # The SPEED MUST BE IN c_cflag. On Linux the baud lives in the cflag's CBAUD bits;
+    # c_ispeed and c_ospeed are only consulted for BOTHER. A cflag assembled without it
+    # has those bits zero, which is B0, which hangs up the line, and the port then goes
+    # silent in a way indistinguishable from absent hardware.
+    attrs[0] = 0
+    attrs[1] = 0
+    attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL | speed
+    attrs[3] = 0
+    attrs[4] = attrs[5] = speed
+    attrs[6][termios.VMIN] = 1
+    attrs[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    return fd
+
+
+def find_port():
+    """Identify the panel by handshake. The MCU answers init with f1 01 13 .."""
+    for path in PORTS:
+        if not os.path.exists(path):
+            continue
+        try:
+            fd = open_port(path)
+        except OSError:
+            continue
+        os.write(fd, frame(CMD_INIT, [0x01]))
+        ready, _, _ = select.select([fd], [], [], 1.0)
+        if ready and MCU_HDR in os.read(fd, 64):
+            return fd, path
+        os.close(fd)
+    return None, None
+
+
+def reset_mcu():
+    """Power-cycle the panel, the only known way back from a display that is off.
+
+    Command 0x11 turns the display OFF rather than clearing it, and text written
+    afterwards lands in a buffer nobody can see. Arg 1 is rejected outright and no
+    command has been found that undoes it. Cutting the rail reboots the MCU into its ROM
+    splash, from which text works again.
+    """
+    try:
+        for value in ("0\n", "1\n"):
+            with open(LCD_POWER, "w") as fh:
+                fh.write(value)
+            time.sleep(2)
+    except OSError:
+        pass
+
+
+def find_input(name):
+    """Match on the device NAME. event* numbering is not stable across reboots."""
+    for entry in sorted(os.listdir("/sys/class/input")):
+        if not entry.startswith("event"):
+            continue
+        try:
+            with open("/sys/class/input/%s/device/name" % entry) as fh:
+                if fh.read().strip() == name:
+                    return os.open("/dev/input/" + entry, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            continue
+    return None
+
+
+def run_hook(button):
+    """Fire HOOK_DIR/<button> if executable, detached.
+
+    Detached matters: a hook that blocked would stop the daemon reading the serial port,
+    so the next press would queue behind it and the panel would appear dead.
+    """
+    path = os.path.join(HOOK_DIR, button)
+    if not os.access(path, os.X_OK):
+        return
+    try:
+        subprocess.Popen([path, button],
+                         stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as exc:
+        print("hook %s: %s" % (button, exc), file=sys.stderr)
+
+
+def sh(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def screen_host():
+    with open("/proc/loadavg") as fh:
+        load = fh.read().split()[0]
+    with open("/proc/uptime") as fh:
+        up = float(fh.read().split()[0])
+    return os.uname().nodename, "up %dd load %s" % (up // 86400, load)
+
+
+def screen_temps():
+    hot = {}
+    for hwmon in sorted(os.listdir("/sys/class/hwmon")):
+        base = "/sys/class/hwmon/" + hwmon
+        try:
+            with open(base + "/name") as fh:
+                chip = fh.read().strip()
+            if chip not in ("coretemp", "drivetemp", "nvme"):
+                continue
+            with open(base + "/temp1_input") as fh:
+                val = int(fh.read()) // 1000
+        except (OSError, ValueError):
+            continue
+        hot[chip] = max(hot.get(chip, 0), val)
+    return "temperature", " ".join("%s%d" % (c[:3], v) for c, v in sorted(hot.items()))
+
+
+def screen_pool():
+    for row in sh(["zpool", "list", "-H", "-o", "name,cap,health"]).splitlines():
+        parts = row.split()
+        if len(parts) >= 3:
+            return parts[0], "%s used %s" % (parts[1], parts[2].lower())
+    return "", ""
+
+
+def screen_root():
+    st = os.statvfs("/")
+    used = 100 - (st.f_bavail * 100 // st.f_blocks)
+    return "rootfs", "%d%% used" % used
+
+
+SCREENS = [screen_host, screen_temps, screen_pool, screen_root]
+
+
+class Panel:
+    def __init__(self, fd):
+        self.fd = fd
+        self.index = 0
+        self.last = 0.0
+        self.shown = (None, None)
+        # Manual mode pins whatever a script wrote. Without it the next status tick
+        # overwrites it within seconds and scripting the display is useless.
+        self.manual = False
+        self.off = False
+
+    def write(self, line0, line1):
+        os.write(self.fd, text_frame(0, line0))
+        time.sleep(0.05)
+        os.write(self.fd, text_frame(1, line1))
+        self.shown = (line0, line1)
+
+    def tick(self):
+        if self.manual or self.off:
+            return
+        now = time.monotonic()
+        if now - self.last >= INTERVAL:
+            self.index = (self.index + 1) % len(SCREENS)
+            self.last = now
+        try:
+            lines = SCREENS[self.index]()
+        except Exception as exc:  # a broken screen must not take the panel down
+            lines = ("screen error", type(exc).__name__[:WIDTH])
+        if not any(lines):
+            return
+        # Only on change, but the first write after start always happens because `shown`
+        # starts empty. A warm reboot leaves the MCU holding whatever was written last,
+        # so the daemon cannot assume it is looking at a blank panel.
+        if lines != self.shown:
+            self.write(*lines)
+
+    def command(self, line):
+        parts = line.split(" ", 2)
+        verb = parts[0].lower() if parts else ""
+
+        if verb == "text":
+            if len(parts) < 2 or parts[1] not in ("0", "1"):
+                return "error: text <0|1> [string]"
+            which = int(parts[1])
+            body = parts[2] if len(parts) > 2 else ""
+            self.manual = True
+            lines = [self.shown[0] or "", self.shown[1] or ""]
+            lines[which] = body
+            self.write(lines[0], lines[1])
+            return "ok"
+
+        if verb == "clear":
+            self.manual = True
+            self.write("", "")
+            return "ok"
+
+        if verb == "off":
+            os.write(self.fd, frame(CMD_DISPLAY, [0x00]))
+            self.off = True
+            return "ok"
+
+        if verb == "on":
+            reset_mcu()  # only a power cycle comes back from `off`
+            self.off = False
+            self.shown = (None, None)
+            return "ok"
+
+        if verb == "auto":
+            self.manual = False
+            self.shown = (None, None)
+            self.last = 0.0
+            return "ok"
+
+        if verb == "screen":
+            if len(parts) < 2 or not parts[1].isdigit():
+                return "error: screen <0-%d>" % (len(SCREENS) - 1)
+            self.index = int(parts[1]) % len(SCREENS)
+            self.manual = False
+            self.last = time.monotonic()
+            self.shown = (None, None)
+            return "ok"
+
+        if verb == "status":
+            mode = "off" if self.off else ("manual" if self.manual else "auto")
+            return "%s screen=%d line0=%s line1=%s" % (
+                mode, self.index, self.shown[0] or "", self.shown[1] or "")
+
+        return "error: unknown command %r" % verb
+
+
+def listen():
+    try:
+        os.unlink(SOCKET_PATH)
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            raise
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o660)
+    srv.listen(4)
+    srv.setblocking(False)
+    return srv
+
+
+def main():
+    # Handshake first, reset only if it fails. Resetting unconditionally would blank the
+    # display for four seconds on every restart of this unit, wanted or not.
+    fd, path = find_port()
+    if fd is None:
+        reset_mcu()
+        fd, path = find_port()
+    if fd is None:
+        print("no panel answered on %s" % ", ".join(PORTS), file=sys.stderr)
+        return 1
+    print("panel on %s" % path, file=sys.stderr)
+
+    panel = Panel(fd)
+    srv = listen()
+    keys = find_input(CFG["keys_device"])
+    power = find_input(CFG["power_device"])
+    watch = [f for f in (fd, srv.fileno(), keys, power) if f is not None]
+    pending = bytearray()
+
+    while True:
+        panel.tick()
+
+        ready, _, _ = select.select(watch, [], [], 1.0)
+        for source in ready:
+            if source == srv.fileno():
+                conn, _ = srv.accept()
+                with conn:
+                    conn.settimeout(2)
+                    try:
+                        data = conn.recv(512).decode("utf-8", "replace").strip()
+                        conn.sendall((panel.command(data) + "\n").encode())
+                    except (OSError, socket.timeout):
+                        pass
+                continue
+
+            if source == fd:
+                pending += os.read(fd, 64)
+                while len(pending) >= 5:
+                    if pending[0] != HOST_HDR:
+                        del pending[0]
+                        continue
+                    if pending[2] == CMD_BUTTON:
+                        name = BUTTONS.get(pending[3])
+                        if name:
+                            if name in ("up", "down") and not panel.manual:
+                                step = 1 if name == "down" else -1
+                                panel.index = (panel.index + step) % len(SCREENS)
+                                panel.last = time.monotonic()
+                                panel.shown = (None, None)
+                            elif name == "back" and panel.manual:
+                                panel.manual = False
+                                panel.shown = (None, None)
+                            run_hook(name)
+                    del pending[:5]
+                continue
+
+            data = os.read(source, INPUT_EVENT.size * 8)
+            for off in range(0, len(data) - INPUT_EVENT.size + 1, INPUT_EVENT.size):
+                _, _, etype, code, value = INPUT_EVENT.unpack_from(data, off)
+                if etype == EV_KEY and value == 1 and code in INPUT_KEYS:
+                    run_hook(INPUT_KEYS[code])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
